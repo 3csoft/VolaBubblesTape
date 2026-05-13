@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Platforms>AnyCPU</Platforms>
+    <AlgoType>Indicator</AlgoType>
+    <AssemblyName>VolaBubbles</AssemblyName>
+    <RootNamespace>VolaBubbles</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    Portable Quantower paths.
+    Override via environment variables (QuantowerBin, QuantowerIndicators)
+    or edit the defaults below. The build copies the resulting .dll directly
+    into Quantower's indicators folder.
+  -->
+  <PropertyGroup>
+    <QuantowerBin Condition="'$(QuantowerBin)' == ''">C:\Quantower\TradingPlatform\v1.145.17\bin</QuantowerBin>
+    <QuantowerIndicators Condition="'$(QuantowerIndicators)' == ''">C:\Quantower\Settings\Scripts\Indicators\VolaBubbles</QuantowerIndicators>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <OutputPath>$(QuantowerIndicators)</OutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <OutputPath>$(QuantowerIndicators)</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="VolaBubbles_BACKUP.cs" />
+    <None Include="VolaBubbles_BACKUP.cs" Condition="Exists('VolaBubbles_BACKUP.cs')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>$(QuantowerBin)\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

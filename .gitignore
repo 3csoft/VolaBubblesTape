@@ -1,0 +1,44 @@
+# =========================================================================
+# .NET / VS build artifacts
+# =========================================================================
+bin/
+obj/
+out/
+publish/
+*.user
+*.suo
+*.userprefs
+*.userosscache
+*.sln.docstates
+
+# Visual Studio cache / temporary files
+.vs/
+*.tmp
+*.tmp_proj
+*.swp
+*~
+
+# Build logs
+*.binlog
+msbuild.log
+*.tlog
+
+# Rider / ReSharper
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# =========================================================================
+# OS files
+# =========================================================================
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# =========================================================================
+# Optional: keep the historical backup out of the public repo
+# (the working source is VolaBubbles.cs; the BACKUP file is excluded
+#  from compilation in the .csproj but you can also keep it out of git).
+# Comment the next line out if you want to publish the BACKUP file too.
+# =========================================================================
+VolaBubbles/VolaBubbles/VolaBubbles_BACKUP.cs
