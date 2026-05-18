@@ -21,6 +21,14 @@ namespace VolaBubbles
             public double Volume { get; set; }
         }
 
+        private class HistoricalBubble
+        {
+            public DateTime TimeLeft { get; set; }
+            public double Price { get; set; }
+            public double Delta { get; set; }
+            public double Volume { get; set; }
+        }
+
         private class QuotePoint
         {
             public long SpawnMs { get; set; }
@@ -77,6 +85,27 @@ namespace VolaBubbles
 
         [InputParameter("Max Bubble Radius", 24)]
         public int MaxRadius = 50;
+
+        [InputParameter("Show Historical Bubbles", 25)]
+        public bool ShowHistoricalBubbles = false;
+
+        [InputParameter("Max Historical Bubbles", 26)]
+        public int MaxHistoricalBubbles = 300;
+
+        [InputParameter("Hist. Bubble Backfill On Start", 27)]
+        public bool HistoricalBubbleBackfill = true;
+
+        [InputParameter("Hist. Bubble Lookback (min)", 28)]
+        public int HistoricalBubbleLookbackMin = 60;
+
+        [InputParameter("Historical Delta Threshold", 29)]
+        public int HistoricalDeltaThreshold = 2;
+
+        [InputParameter("Historical Positive Delta Color", 36)]
+        public Color HistoricalPosColor = Color.FromArgb(120, Color.DarkGreen);
+
+        [InputParameter("Historical Negative Delta Color", 37)]
+        public Color HistoricalNegColor = Color.FromArgb(120, Color.DarkRed);
 
         [InputParameter("Show Volume Text", 30)]
         public bool ShowVolumeText = true;
@@ -173,6 +202,7 @@ namespace VolaBubbles
         private readonly object stateLock = new object();
         private readonly Dictionary<double, PriceLevelData> currentBucketVolumes = new Dictionary<double, PriceLevelData>();
         private readonly List<TapeBubble> tapeBubbles = new List<TapeBubble>();
+        private readonly List<HistoricalBubble> historicalBubbles = new List<HistoricalBubble>();
         private readonly List<QuotePoint> quotePoints = new List<QuotePoint>();
         private readonly List<DomColumn> domColumns = new List<DomColumn>();
         private readonly Stopwatch clock = new Stopwatch();
@@ -257,6 +287,7 @@ namespace VolaBubbles
             lock (stateLock)
             {
                 tapeBubbles.Clear();
+                historicalBubbles.Clear();
                 quotePoints.Clear();
                 domColumns.Clear();
                 currentBucketVolumes.Clear();
@@ -281,7 +312,7 @@ namespace VolaBubbles
 
             // Backfill az ablak hosszára (pl. 30 perc) háttérszálon, hogy ne blokkolja az OnInit-et.
             // A POC indulás után azonnal pontos lesz, nem kell megvárni, amíg élő tick-ekből felépül.
-            StartVolumeProfileBackfill();
+            StartBackgroundBackfill();
 
             UpdateShortName();
         }
@@ -308,6 +339,7 @@ namespace VolaBubbles
             lock (stateLock)
             {
                 tapeBubbles.Clear();
+                historicalBubbles.Clear();
                 quotePoints.Clear();
                 domColumns.Clear();
                 currentBucketVolumes.Clear();
@@ -319,10 +351,11 @@ namespace VolaBubbles
         {
             string heatmap = ShowHeatmap ? "on" : "off";
             string openOrder = ShowOpenOrderIndicator ? "on" : "off";
+            string hist = ShowHistoricalBubbles ? $"on/{MaxHistoricalBubbles}" : "off";
             string vp = IsVolumeProfileActive
                 ? $"on/{VolumeProfileWindowMin}min/{(VolumeProfileRolling ? "roll" : "fix")}{(VolumeProfileBackfill ? "/bf" : "")}{(ShowMarketProfile ? "/mp" : "")}{(ShowVolumeProfilePoc ? "/poc" : "")}"
                 : "off";
-            this.ShortName = $"VolaBubbles Tape (Speed: {TapeSpeedPxPerSec}px/s, Width: {TapeWidthBars} bars, Bucket: {BucketMs}ms, Heatmap: {heatmap}, OpenOrder: {openOrder}, VP: {vp})";
+            this.ShortName = $"VolaBubbles Tape (Speed: {TapeSpeedPxPerSec}px/s, Width: {TapeWidthBars} bars, Bucket: {BucketMs}ms, Heatmap: {heatmap}, Hist: {hist}, OpenOrder: {openOrder}, VP: {vp})";
         }
 
         private double GetRoundedPrice(double price)
@@ -428,6 +461,13 @@ namespace VolaBubbles
 
         private void FlushBucket(long now)
         {
+            if (currentBucketVolumes.Count == 0)
+            {
+                currentBucketStartMs = now;
+                return;
+            }
+
+            DateTime chartTime = GetCurrentChartTime();
             foreach (var kvp in currentBucketVolumes)
             {
                 double delta = kvp.Value.BuyVolume - kvp.Value.SellVolume;
@@ -442,9 +482,48 @@ namespace VolaBubbles
                         Volume = volume
                     });
                 }
+
+                if (ShowHistoricalBubbles)
+                    AddHistoricalBubbleFromBucket(chartTime, kvp.Key, delta, volume);
             }
+
+            if (ShowHistoricalBubbles)
+                TrimHistoricalBubbles();
+
             currentBucketVolumes.Clear();
             currentBucketStartMs = now;
+        }
+
+        private static DateTime GetCurrentChartTime()
+        {
+            try { return Core.Instance?.TimeUtils?.DateTimeUtcNow ?? DateTime.UtcNow; }
+            catch { return DateTime.UtcNow; }
+        }
+
+        private void TrimHistoricalBubbles()
+        {
+            int max = MaxHistoricalBubbles > 0 ? MaxHistoricalBubbles : 300;
+            if (historicalBubbles.Count <= max) return;
+            historicalBubbles.RemoveRange(0, historicalBubbles.Count - max);
+        }
+
+        private int GetHistoricalDeltaThreshold()
+        {
+            return HistoricalDeltaThreshold > 0 ? HistoricalDeltaThreshold : 1;
+        }
+
+        private void AddHistoricalBubbleFromBucket(DateTime chartTime, double price, double delta, double volume)
+        {
+            if (!ShowHistoricalBubbles) return;
+            if (Math.Abs(delta) < GetHistoricalDeltaThreshold()) return;
+
+            historicalBubbles.Add(new HistoricalBubble
+            {
+                TimeLeft = chartTime,
+                Price = price,
+                Delta = delta,
+                Volume = volume
+            });
         }
 
         private void AddQuotePoint(long now)
@@ -564,6 +643,9 @@ namespace VolaBubbles
             try
             {
                 gr.SmoothingMode = SmoothingMode.AntiAlias;
+
+                DrawHistoricalBubbles(gr, converter, tapeLeftX, top, height);
+
                 gr.SetClip(new RectangleF(tapeLeftX, top, tapeRightX - tapeLeftX, height));
 
                 if (ShowHeatmap)
@@ -888,6 +970,50 @@ namespace VolaBubbles
             }
         }
 
+        private void DrawHistoricalBubbles(
+            Graphics gr,
+            IChartWindowCoordinatesConverter converter,
+            float chartRightX,
+            float top,
+            float height)
+        {
+            if (!ShowHistoricalBubbles) return;
+
+            HistoricalBubble[] snapshot;
+            lock (stateLock)
+            {
+                snapshot = historicalBubbles.ToArray();
+            }
+
+            if (snapshot.Length == 0) return;
+
+            var clipState = gr.Save();
+            try
+            {
+                gr.SetClip(new RectangleF(0, top, chartRightX, height));
+
+                using (var volumeFont = new Font("Arial", 8f, FontStyle.Bold))
+                using (var volumeBrush = new SolidBrush(VolumeTextColor))
+                using (var outlinePen = new Pen(Color.FromArgb(220, Color.White), 1f))
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    for (int i = 0; i < snapshot.Length; i++)
+                    {
+                        var bubble = snapshot[i];
+                        float x = (float)converter.GetChartX(bubble.TimeLeft);
+                        if (x < 0 || x > chartRightX) continue;
+
+                        float y = (float)converter.GetChartY(bubble.Price);
+                        DrawBubbleAt(gr, x, y, bubble.Delta, bubble.Volume, volumeFont, volumeBrush, outlinePen, sf, HistoricalPosColor, HistoricalNegColor);
+                    }
+                }
+            }
+            finally
+            {
+                gr.Restore(clipState);
+            }
+        }
+
         private void DrawBubbles(Graphics gr, IChartWindowCoordinatesConverter converter, float tapeLeftX, float tapeRightX)
         {
             long now = clock.ElapsedMilliseconds;
@@ -910,22 +1036,39 @@ namespace VolaBubbles
                     if (x < tapeLeftX || x > tapeRightX) continue;
 
                     float y = (float)converter.GetChartY(bubble.Price);
-
-                    float radius = 8f + (float)Math.Abs(bubble.Delta);
-                    if (radius > MaxRadius) radius = MaxRadius;
-
-                    Color bubbleColor = bubble.Delta > 0 ? PosColor : NegColor;
-                    using (var b = new SolidBrush(bubbleColor))
-                        gr.FillEllipse(b, x - radius, y - radius, radius * 2, radius * 2);
-
-                    gr.DrawEllipse(outlinePen, x - radius, y - radius, radius * 2, radius * 2);
-
-                    if (ShowVolumeText && bubble.Volume > 0)
-                    {
-                        string text = FormatVolume(bubble.Volume);
-                        gr.DrawString(text, volumeFont, volumeBrush, x, y, sf);
-                    }
+                    DrawBubbleAt(gr, x, y, bubble.Delta, bubble.Volume, volumeFont, volumeBrush, outlinePen, sf);
                 }
+            }
+        }
+
+        private void DrawBubbleAt(
+            Graphics gr,
+            float x,
+            float y,
+            double delta,
+            double volume,
+            Font volumeFont,
+            Brush volumeBrush,
+            Pen outlinePen,
+            StringFormat sf,
+            Color? posColor = null,
+            Color? negColor = null)
+        {
+            float radius = 8f + (float)Math.Abs(delta);
+            if (radius > MaxRadius) radius = MaxRadius;
+
+            Color bubbleColor = delta > 0
+                ? (posColor ?? PosColor)
+                : (negColor ?? NegColor);
+            using (var b = new SolidBrush(bubbleColor))
+                gr.FillEllipse(b, x - radius, y - radius, radius * 2, radius * 2);
+
+            gr.DrawEllipse(outlinePen, x - radius, y - radius, radius * 2, radius * 2);
+
+            if (ShowVolumeText && volume > 0)
+            {
+                string text = FormatVolume(volume);
+                gr.DrawString(text, volumeFont, volumeBrush, x, y, sf);
             }
         }
 
@@ -1353,15 +1496,13 @@ namespace VolaBubbles
             return price.ToString("0.0000");
         }
 
-        // --- VP Backfill (induló adatfeltöltés a profil ablakra) ---
+        // --- Háttér backfill (VP + historical bubbles) ---
 
-        // Háttérszálon kérdezi le a múlt N percnyi adatát a Quantowertől, és feltölti
-        // a profileTrades listát. A timestamp-eket úgy konvertálja, hogy a meglévő
-        // rolling/fix ablak logika továbbra is helyesen működjön a clock-on alapulva.
-        private void StartVolumeProfileBackfill()
+        private void StartBackgroundBackfill()
         {
-            if (!IsVolumeProfileActive) return;
-            if (!VolumeProfileBackfill) return;
+            bool vp = IsVolumeProfileActive && VolumeProfileBackfill;
+            bool hist = ShowHistoricalBubbles && HistoricalBubbleBackfill;
+            if (!vp && !hist) return;
             if (this.Symbol == null) return;
 
             var cts = new CancellationTokenSource();
@@ -1369,10 +1510,200 @@ namespace VolaBubbles
 
             Task.Run(() =>
             {
-                try { BackfillVolumeProfile(cts.Token); }
+                try
+                {
+                    if (vp) BackfillVolumeProfile(cts.Token);
+                    if (cts.IsCancellationRequested) return;
+                    if (hist) BackfillHistoricalBubbles(cts.Token);
+                }
                 catch { /* csendesen, ha a vendor nem ad history-t */ }
+                finally
+                {
+                    try { this.CurrentChart?.RedrawBuffer(); }
+                    catch { }
+                }
             }, cts.Token);
         }
+
+        private void BackfillHistoricalBubbles(CancellationToken token)
+        {
+            if (token.IsCancellationRequested) return;
+
+            int lookbackMin = HistoricalBubbleLookbackMin > 0 ? HistoricalBubbleLookbackMin : 60;
+            DateTime nowUtc;
+            try { nowUtc = Core.Instance?.TimeUtils?.DateTimeUtcNow ?? DateTime.UtcNow; }
+            catch { nowUtc = DateTime.UtcNow; }
+            DateTime fromUtc = nowUtc.AddMinutes(-lookbackMin);
+
+            bool gotTicks = TryBackfillHistoricalBubblesFromTickHistory(fromUtc, nowUtc, token);
+            if (token.IsCancellationRequested) return;
+
+            if (!gotTicks)
+                TryBackfillHistoricalBubblesFromChartBars(fromUtc, nowUtc, token);
+
+            lock (stateLock)
+                TrimHistoricalBubbles();
+        }
+
+        private bool TryBackfillHistoricalBubblesFromTickHistory(DateTime fromUtc, DateTime toUtc, CancellationToken token)
+        {
+            try
+            {
+                var symbol = this.Symbol;
+                if (symbol == null) return false;
+
+                HistoricalData hist = symbol.GetHistory(Period.TICK1, HistoryType.Last, fromUtc, toUtc);
+                if (hist == null || hist.Count == 0) return false;
+
+                var ticks = new List<(DateTime Time, double Price, double Size, AggressorFlag Agg)>();
+                for (int i = 0; i < hist.Count; i++)
+                {
+                    if (token.IsCancellationRequested) return false;
+
+                    var item = hist[i];
+                    if (item == null) continue;
+
+                    DateTime time = item.TimeLeft;
+                    double price = 0;
+                    double size = 0;
+                    var agg = AggressorFlag.NotSet;
+
+                    if (item is HistoryItemLast tick)
+                    {
+                        price = tick.Price;
+                        size = tick.Volume;
+                        agg = tick.AggressorFlag;
+                    }
+                    else if (item is HistoryItemBar bar)
+                    {
+                        price = bar.Close;
+                        size = bar.Volume;
+                    }
+
+                    if (price <= 0 || size <= 0) continue;
+                    if (agg == AggressorFlag.NotSet) continue;
+
+                    ticks.Add((time, GetRoundedPrice(price), size, agg));
+                }
+
+                if (ticks.Count == 0) return false;
+                ticks.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+                lock (stateLock)
+                {
+                    BuildHistoricalBubblesFromTicks(ticks);
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryBackfillHistoricalBubblesFromChartBars(DateTime fromUtc, DateTime toUtc, CancellationToken token)
+        {
+            try
+            {
+                var hd = this.HistoricalData;
+                if (hd == null || hd.Count == 0) return false;
+
+                var bars = new List<(DateTime Time, double Price, double Volume)>();
+                for (int i = hd.Count - 1; i >= 0; i--)
+                {
+                    if (token.IsCancellationRequested) return false;
+
+                    var item = hd[i];
+                    if (item == null) continue;
+                    if (item.TimeLeft < fromUtc) break;
+
+                    double price = 0;
+                    double vol = 0;
+
+                    if (item is HistoryItemBar bar)
+                    {
+                        price = bar.Close;
+                        vol = bar.Volume;
+                    }
+                    else if (item is HistoryItemLast tick)
+                    {
+                        price = tick.Price;
+                        vol = tick.Volume;
+                    }
+
+                    if (price <= 0 || vol <= 0) continue;
+                    bars.Add((item.TimeLeft, GetRoundedPrice(price), vol));
+                }
+
+                if (bars.Count == 0) return false;
+                bars.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+                lock (stateLock)
+                {
+                    foreach (var bar in bars)
+                    {
+                        // Bar fallback: nincs buy/sell bontás, delta = teljes volume (pozitív buborék).
+                        AddHistoricalBubbleFromBucket(bar.Time, bar.Price, bar.Volume, bar.Volume);
+                    }
+                    TrimHistoricalBubbles();
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Tick history: ugyanaz a bucket logika, mint élőben (BucketMs + HistoricalDeltaThreshold).
+        private void BuildHistoricalBubblesFromTicks(List<(DateTime Time, double Price, double Size, AggressorFlag Agg)> ticks)
+        {
+            if (ticks.Count == 0) return;
+
+            int bucketMs = BucketMs > 0 ? BucketMs : 500;
+            var bucketVolumes = new Dictionary<double, PriceLevelData>();
+            DateTime bucketStart = ticks[0].Time;
+            DateTime bucketAnchor = bucketStart;
+
+            void FlushCurrentBucket()
+            {
+                foreach (var kvp in bucketVolumes)
+                {
+                    double delta = kvp.Value.BuyVolume - kvp.Value.SellVolume;
+                    double volume = kvp.Value.BuyVolume + kvp.Value.SellVolume;
+                    AddHistoricalBubbleFromBucket(bucketAnchor, kvp.Key, delta, volume);
+                }
+                bucketVolumes.Clear();
+            }
+
+            for (int i = 0; i < ticks.Count; i++)
+            {
+                var tick = ticks[i];
+                if ((tick.Time - bucketStart).TotalMilliseconds >= bucketMs)
+                {
+                    FlushCurrentBucket();
+                    bucketStart = tick.Time;
+                    bucketAnchor = tick.Time;
+                }
+
+                if (!bucketVolumes.TryGetValue(tick.Price, out var pld))
+                {
+                    pld = new PriceLevelData();
+                    bucketVolumes[tick.Price] = pld;
+                }
+
+                if (tick.Agg == AggressorFlag.Buy)
+                    pld.BuyVolume += tick.Size;
+                else
+                    pld.SellVolume += tick.Size;
+            }
+
+            FlushCurrentBucket();
+        }
+
+        // --- VP Backfill (induló adatfeltöltés a profil ablakra) ---
 
         private void BackfillVolumeProfile(CancellationToken token)
         {
