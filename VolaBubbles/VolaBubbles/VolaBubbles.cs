@@ -302,11 +302,11 @@ namespace VolaBubbles
                 this.Symbol.NewLevel2 -= this.Symbol_NewLevel2;
 
                 this.Symbol.NewLast += this.Symbol_NewLast;
-                // A NewLevel2 eseményre való feliratkozás kéri meg a Quantowert,
-                // hogy küldje el a vendor-felé az order book feliratkozási kérést.
-                // Üres handler is elég — mi a DepthOfMarket pillanatképből veszünk adatot.
+                // L2: a feliratkozás kéri a vendor order book streamjét (heatmap-hez szükséges).
                 this.Symbol.NewLevel2 += this.Symbol_NewLevel2;
             }
+
+            lastHeatmapSampleMs = long.MinValue / 2;
 
             tapeTimer = new Timer(OnTapeTick, null, 0, 33);
 
@@ -374,8 +374,12 @@ namespace VolaBubbles
 
         private void Symbol_NewLevel2(Symbol symbol, Level2Quote level2, DOMQuote dom)
         {
-            // Üres handler: a feliratkozás puszta ténye triggereli az L2 streamet.
-            // Az aggregált DOM-ot a SampleDom() periodikusan veszi le.
+            // A feliratkozás kéri az L2 streamet; friss DOM esetén azonnal mintavétel (throttle SampleDom-ban).
+            if (!ShowHeatmap) return;
+
+            long now = clock.ElapsedMilliseconds;
+            lock (stateLock)
+                SampleDom(now);
         }
 
         private void Symbol_NewLast(Symbol symbol, Last last)
@@ -567,6 +571,7 @@ namespace VolaBubbles
 
                 var pars = new GetLevel2ItemsParameters
                 {
+                    AggregateMethod = AggregateMethod.ByPriceLVL,
                     LevelsCount = levelsCount,
                     CustomTickSize = step,
                     CalculateCumulative = false
@@ -649,7 +654,12 @@ namespace VolaBubbles
                 gr.SetClip(new RectangleF(tapeLeftX, top, tapeRightX - tapeLeftX, height));
 
                 if (ShowHeatmap)
+                {
+                    long now = clock.ElapsedMilliseconds;
+                    lock (stateLock)
+                        SampleDom(now);
                     DrawHeatmap(gr, converter, tapeLeftX, tapeRightX);
+                }
 
                 DrawMarketProfile(gr, converter, tapeLeftX, tapeRightX);
                 DrawVolumeProfilePoc(gr, converter, tapeLeftX, tapeRightX);
