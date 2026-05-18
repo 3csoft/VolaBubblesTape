@@ -159,6 +159,15 @@ namespace VolaBubbles
         [InputParameter("VP Backfill On Start", 77)]
         public bool VolumeProfileBackfill = true;
 
+        [InputParameter("Show Market Profile", 78)]
+        public bool ShowMarketProfile = false;
+
+        [InputParameter("Market Profile Color", 79)]
+        public Color MarketProfileColor = Color.FromArgb(140, 90, 120, 180);
+
+        [InputParameter("Market Profile Opacity (0.0..1.0)", 80)]
+        public double MarketProfileOpacity = 0.55;
+
         // --- Belső állapot ---
 
         private readonly object stateLock = new object();
@@ -189,7 +198,12 @@ namespace VolaBubbles
         private double pocPrice2;
         private bool pocHasValue1;
         private bool pocHasValue2;
+        private readonly Dictionary<double, double> profileVolumeByPrice = new Dictionary<double, double>();
+        private double profileMaxVolume;
+        private bool profileVolumeValid;
         private const int PocComputeIntervalMs = 250;
+
+        private bool IsVolumeProfileActive => ShowVolumeProfilePoc || ShowMarketProfile;
 
         // Backfill: egy CancellationTokenSource amit OnClear/újra-OnInit megsemmisít,
         // hogy a háttérben futó history lekérés ne zavarja a friss állapotot.
@@ -236,6 +250,9 @@ namespace VolaBubbles
             pocPrice2 = 0;
             pocHasValue1 = false;
             pocHasValue2 = false;
+            profileVolumeByPrice.Clear();
+            profileMaxVolume = 0;
+            profileVolumeValid = false;
 
             lock (stateLock)
             {
@@ -302,8 +319,8 @@ namespace VolaBubbles
         {
             string heatmap = ShowHeatmap ? "on" : "off";
             string openOrder = ShowOpenOrderIndicator ? "on" : "off";
-            string vp = ShowVolumeProfilePoc
-                ? $"on/{VolumeProfileWindowMin}min/{(VolumeProfileRolling ? "roll" : "fix")}{(VolumeProfileBackfill ? "/bf" : "")}"
+            string vp = IsVolumeProfileActive
+                ? $"on/{VolumeProfileWindowMin}min/{(VolumeProfileRolling ? "roll" : "fix")}{(VolumeProfileBackfill ? "/bf" : "")}{(ShowMarketProfile ? "/mp" : "")}{(ShowVolumeProfilePoc ? "/poc" : "")}"
                 : "off";
             this.ShortName = $"VolaBubbles Tape (Speed: {TapeSpeedPxPerSec}px/s, Width: {TapeWidthBars} bars, Bucket: {BucketMs}ms, Heatmap: {heatmap}, OpenOrder: {openOrder}, VP: {vp})";
         }
@@ -337,7 +354,7 @@ namespace VolaBubbles
             {
                 // A volume profile minden trade-et regisztrál, aggressor flag-től függetlenül.
                 // Ez ad a POC-nak teljes képet, akkor is, ha a vendor nem küld AggressorFlag-et.
-                if (ShowVolumeProfilePoc && last.Size > 0)
+                if (IsVolumeProfileActive && last.Size > 0)
                 {
                     profileTrades.Add(new ProfileTrade
                     {
@@ -552,6 +569,7 @@ namespace VolaBubbles
                 if (ShowHeatmap)
                     DrawHeatmap(gr, converter, tapeLeftX, tapeRightX);
 
+                DrawMarketProfile(gr, converter, tapeLeftX, tapeRightX);
                 DrawVolumeProfilePoc(gr, converter, tapeLeftX, tapeRightX);
 
                 DrawBidAskLines(gr, converter, tapeLeftX, tapeRightX);
@@ -1084,11 +1102,14 @@ namespace VolaBubbles
         // Hívás kontextusa: a meglévő stateLock alól.
         private void MaintainVolumeProfile(long now)
         {
-            if (!ShowVolumeProfilePoc)
+            if (!IsVolumeProfileActive)
             {
                 if (profileTrades.Count > 0) profileTrades.Clear();
                 pocHasValue1 = false;
                 pocHasValue2 = false;
+                profileVolumeByPrice.Clear();
+                profileMaxVolume = 0;
+                profileVolumeValid = false;
                 return;
             }
 
@@ -1114,43 +1135,50 @@ namespace VolaBubbles
 
             if (now - lastPocComputeMs >= PocComputeIntervalMs)
             {
-                ComputePocs();
+                ComputeVolumeProfile();
                 lastPocComputeMs = now;
             }
         }
 
-        // A profileTrades-ből egy árszint -> összvolumen szótárt épít, majd
-        // megkeresi a legnagyobb (POC 1) és a min. távolságra eső második (POC 2) csúcsot.
+        // A profileTrades-ből árszintenkénti volumen profilt épít; POC-kat is innen számolja.
         // Hívás kontextusa: a meglévő stateLock alól.
-        private void ComputePocs()
+        private void ComputeVolumeProfile()
         {
-            if (profileTrades.Count == 0)
-            {
-                pocHasValue1 = false;
-                pocHasValue2 = false;
-                return;
-            }
+            profileVolumeByPrice.Clear();
+            profileMaxVolume = 0;
+            profileVolumeValid = false;
+            pocHasValue1 = false;
+            pocHasValue2 = false;
 
-            var agg = new Dictionary<double, double>();
+            if (profileTrades.Count == 0)
+                return;
+
             for (int i = 0; i < profileTrades.Count; i++)
             {
                 var t = profileTrades[i];
-                if (agg.TryGetValue(t.Price, out var v))
-                    agg[t.Price] = v + t.Size;
+                if (profileVolumeByPrice.TryGetValue(t.Price, out var v))
+                    profileVolumeByPrice[t.Price] = v + t.Size;
                 else
-                    agg[t.Price] = t.Size;
+                    profileVolumeByPrice[t.Price] = t.Size;
             }
 
-            if (agg.Count == 0)
-            {
-                pocHasValue1 = false;
-                pocHasValue2 = false;
+            if (profileVolumeByPrice.Count == 0)
                 return;
+
+            foreach (var kvp in profileVolumeByPrice)
+            {
+                if (kvp.Value > profileMaxVolume)
+                    profileMaxVolume = kvp.Value;
             }
+
+            profileVolumeValid = profileMaxVolume > 0;
+
+            if (!ShowVolumeProfilePoc)
+                return;
 
             double p1 = 0;
             double v1 = -1;
-            foreach (var kvp in agg)
+            foreach (var kvp in profileVolumeByPrice)
             {
                 if (kvp.Value > v1)
                 {
@@ -1162,13 +1190,12 @@ namespace VolaBubbles
             pocPrice1 = p1;
             pocHasValue1 = v1 > 0;
 
-            // POC 2: minimum távolságot tartunk POC 1-től, hogy ne a szomszédja legyen.
             double step = GetActualStep();
             double minDist = step * Math.Max(0, Poc2MinDistanceTicks);
 
             double p2 = 0;
             double v2 = -1;
-            foreach (var kvp in agg)
+            foreach (var kvp in profileVolumeByPrice)
             {
                 if (Math.Abs(kvp.Key - p1) < minDist) continue;
                 if (kvp.Value > v2)
@@ -1183,9 +1210,82 @@ namespace VolaBubbles
                 pocPrice2 = p2;
                 pocHasValue2 = true;
             }
-            else
+        }
+
+        private void DrawMarketProfile(
+            Graphics gr,
+            IChartWindowCoordinatesConverter converter,
+            float tapeLeftX,
+            float tapeRightX)
+        {
+            if (!ShowMarketProfile) return;
+
+            KeyValuePair<double, double>[] levels;
+            double maxVol;
+            lock (stateLock)
             {
-                pocHasValue2 = false;
+                if (!profileVolumeValid || profileVolumeByPrice.Count == 0)
+                    return;
+
+                levels = profileVolumeByPrice.ToArray();
+                maxVol = profileMaxVolume;
+            }
+
+            if (maxVol <= 0) return;
+
+            double step = GetActualStep();
+            if (step <= 0) step = 0.25;
+
+            float halfStep = (float)(step / 2.0);
+            float tapeWidth = tapeRightX - tapeLeftX;
+            if (tapeWidth < 1f) return;
+
+            double opacity = MarketProfileOpacity;
+            if (opacity < 0) opacity = 0;
+            if (opacity > 1) opacity = 1;
+
+            int baseAlpha = MarketProfileColor.A;
+            int alpha = (int)Math.Round(baseAlpha * opacity);
+            if (alpha <= 0) return;
+            if (alpha > 255) alpha = 255;
+
+            var fillColor = Color.FromArgb(alpha, MarketProfileColor.R, MarketProfileColor.G, MarketProfileColor.B);
+
+            var prevSmoothing = gr.SmoothingMode;
+            gr.SmoothingMode = SmoothingMode.None;
+
+            try
+            {
+                using (var brush = new SolidBrush(fillColor))
+                {
+                    for (int i = 0; i < levels.Length; i++)
+                    {
+                        double volume = levels[i].Value;
+                        if (volume <= 0) continue;
+
+                        double price = levels[i].Key;
+                        float yTop = (float)converter.GetChartY(price + halfStep);
+                        float yBottom = (float)converter.GetChartY(price - halfStep);
+                        if (yBottom < yTop)
+                        {
+                            float tmp = yTop;
+                            yTop = yBottom;
+                            yBottom = tmp;
+                        }
+
+                        float h = yBottom - yTop;
+                        if (h < 1f) h = 1f;
+
+                        float barWidth = tapeWidth * (float)(volume / maxVol);
+                        if (barWidth < 1f) continue;
+
+                        gr.FillRectangle(brush, tapeLeftX, yTop, barWidth, h);
+                    }
+                }
+            }
+            finally
+            {
+                gr.SmoothingMode = prevSmoothing;
             }
         }
 
@@ -1260,7 +1360,7 @@ namespace VolaBubbles
         // rolling/fix ablak logika továbbra is helyesen működjön a clock-on alapulva.
         private void StartVolumeProfileBackfill()
         {
-            if (!ShowVolumeProfilePoc) return;
+            if (!IsVolumeProfileActive) return;
             if (!VolumeProfileBackfill) return;
             if (this.Symbol == null) return;
 
@@ -1295,7 +1395,7 @@ namespace VolaBubbles
             // Azonnal számoljunk POC-ot, hogy ne kelljen 250ms-ig várni rá.
             lock (stateLock)
             {
-                ComputePocs();
+                ComputeVolumeProfile();
                 lastPocComputeMs = clock.ElapsedMilliseconds;
             }
         }

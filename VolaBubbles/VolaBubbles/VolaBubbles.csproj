@@ -43,4 +43,19 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+
+  <!-- After Release build, copy ship-ready files into repo-root dist/ for GitHub. -->
+  <PropertyGroup>
+    <RepoDistDir>$(MSBuildThisFileDirectory)..\..\dist\</RepoDistDir>
+  </PropertyGroup>
+  <Target Name="CopyReleaseArtifactsToDist" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <MakeDir Directories="$(RepoDistDir)" />
+    <ItemGroup>
+      <_DistDlls Include="$(OutputPath)*.dll" Exclude="$(OutputPath)TradingPlatform*.dll" />
+      <_DistDeps Include="$(OutputPath)VolaBubbles.deps.json" Condition="Exists('$(OutputPath)VolaBubbles.deps.json')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DistDlls)" DestinationFolder="$(RepoDistDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_DistDeps)" DestinationFolder="$(RepoDistDir)" SkipUnchangedFiles="true" Condition="@(_DistDeps->Count()) &gt; 0" />
+    <Message Importance="high" Text="Copied release artifacts to $(RepoDistDir)" />
+  </Target>
 </Project>

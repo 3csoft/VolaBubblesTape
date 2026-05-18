@@ -7,6 +7,8 @@ VolaBubbles renders a continuously moving lane to the right of the latest candle
 - **Delta bubbles** — aggressor buy/sell deltas aggregated per short time bucket and price level, rendered as colored bubbles whose size scales with the absolute delta. Volume is printed on top of each bubble.
 - **Bid / Ask trail** — sampled bid and ask prices flow with the tape, so you can see how the spread evolved second-by-second.
 - **Level 2 heatmap** (optional) — periodic snapshots of the order book aggregated into vertical price-level columns, colored by a hot palette (dark blue -> purple -> red -> yellow) based on a running-max with decay window. Bigger limit orders glow brighter.
+- **Market profile** (optional) — horizontal volume histogram on the tape for the configured VP window, behind price action.
+- **Volume profile POC** (optional) — POC 1 and POC 2 lines over the same window.
 
 All elements share the same speed and drift left-to-right with a configurable pixel-per-second rate.
 
@@ -24,21 +26,52 @@ All elements share the same speed and drift left-to-right with a configurable pi
 
 ## Install
 
-### Option A: drop-in DLL (no compilation)
+Quantower loads custom indicators from the **user settings** tree (not from `Program Files`). The usual folder on Windows is:
 
-1. Download the latest `VolaBubbles.zip` from the [Releases](../../releases) page.
-2. Extract it into `C:\Quantower\Settings\Scripts\Indicators\VolaBubbles\` (create the folder if needed).
-3. In Quantower, on a chart, click `Indicators` -> `Custom` -> `VolaBubbles Tape`.
+`C:\Quantower\Settings\Scripts\Indicators\VolaBubbles\`
 
-### Option B: build from source
+Create the `VolaBubbles` subfolder if it does not exist. After copying, restart Quantower (or reload scripts if your build supports it), then add the indicator from the chart: **Indicators → Custom → VolaBubbles Tape**.
+
+### Option A: pre-built files from the `dist/` folder (no compilation)
+
+This repository ships a **Release** build under [`dist/`](dist/). It contains `VolaBubbles.dll` plus any companion files the compiler emits (for example `VolaBubbles.deps.json`). Copy **everything** from `dist/` **except** `README.txt` into the Quantower indicators folder above.
+
+PowerShell (from your cloned repo root):
 
 ```powershell
-git clone https://github.com/<your-user>/VolaBubbles.git
-cd VolaBubbles
+$dest = "C:\Quantower\Settings\Scripts\Indicators\VolaBubbles"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item -Path ".\dist\*.dll",".\dist\*.deps.json" -Destination $dest -Force -ErrorAction SilentlyContinue
+```
+
+If your Quantower profile lives elsewhere, replace `$dest` with your actual `...\Settings\Scripts\Indicators\VolaBubbles\` path.
+
+**Is committing binaries to Git valid?** Yes, for small tools it is common so `git clone` is enough. For larger projects, [GitHub Releases](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) with a `.zip` attachment is the usual best practice so the main tree stays lean. This repo uses both patterns: tracked `dist/` for convenience, and you can still attach a zip on Releases for tagged versions.
+
+### Option B: GitHub Releases zip (optional)
+
+1. Download the latest `VolaBubbles.zip` from the [Releases](../../releases) page (when published).
+2. Extract into `C:\Quantower\Settings\Scripts\Indicators\VolaBubbles\`.
+3. Add the indicator on a chart as above.
+
+### Option C: build from source
+
+```powershell
+git clone https://github.com/3csoft/VolaBubblesTape.git
+cd VolaBubblesTape
 dotnet build VolaBubbles\VolaBubbles\VolaBubbles.csproj -c Release
 ```
 
-The build output is copied directly into your Quantower indicators folder. The path is auto-resolved by the `.csproj`; you can override it with environment variables (see below).
+The build writes the indicator into your Quantower indicators folder (see environment variables below) **and** refreshes the repo-root `dist/` folder on **Release** builds so you can commit the updated binaries.
+
+#### Maintainer: refresh `dist/` before pushing
+
+```powershell
+dotnet build VolaBubbles\VolaBubbles\VolaBubbles.csproj -c Release
+git add dist/
+git status
+git commit -m "chore: refresh dist binaries for release"
+```
 
 #### Environment variables (optional)
 
@@ -90,6 +123,19 @@ Open a fresh shell after `setx` for the values to be visible.
 - **Heatmap Min Alpha %** — cutoff threshold: levels weaker than this are not drawn.
 - **Heatmap Max Levels (cap)** — safety cap on the number of L2 levels requested per side.
 - **Heatmap Opacity (0.0..1.0)** — global opacity multiplier on the hot palette.
+
+### Volume profile & POC
+
+- **Show Volume Profile POC** — horizontal POC 1 / POC 2 lines across the tape.
+- **VP Window (minutes)** — rolling or fixed lookback for profile data.
+- **VP Rolling Window (false = Fixed)** — rolling = last N minutes; fixed = reset every N minutes.
+- **POC 1 / POC 2 Color**, **POC 2 Min Distance (ticks)**, **Show POC Labels** — line styling.
+- **VP Backfill On Start** — preload the window from tick history (or bar fallback) on init.
+
+### Market profile (histogram)
+
+- **Show Market Profile** — volume-by-price bars on the tape, drawn **behind** bid/ask lines and delta bubbles.
+- **Market Profile Color** / **Market Profile Opacity (0.0..1.0)** — fill color and transparency (uses the same VP window and trade feed as POC).
 
 ## How the heatmap normalizes color
 
