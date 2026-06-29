@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using TradingPlatform.BusinessLayer;
@@ -198,14 +201,13 @@ namespace VolaBubbles
         [InputParameter("Market Profile Opacity (0.0..1.0)", 80)]
         public double MarketProfileOpacity = 0.55;
 
-        [InputParameter("Show Price Targets Ticks", 85)]
-        public bool ShowPriceTargetsTicks = true;
+        // Price Targets — kikapcsolva a UI-ból; PriceTargetsFeatureEnabled = true esetén aktiválható.
+        private const bool PriceTargetsFeatureEnabled = false;
 
-        [InputParameter("Price Targets Label Color", 86)]
-        public Color PriceTargetsLabelColor = Color.FromArgb(255, 128, 128, 128);
-
-        [InputParameter("Position Risk Amount", 87)]
-        public double PositionRiskAmount = 100.0;
+        private bool showPriceTargetsTicks;
+        private Color priceTargetsLabelColor = Color.FromArgb(255, 128, 128, 128);
+        private double positionRiskAmount = 100.0;
+        private bool showPriceTargetsDirectionDebug;
 
         // --- Belső állapot ---
 
@@ -250,6 +252,25 @@ namespace VolaBubbles
         private double profileMaxVolume;
         private bool profileVolumeValid;
         private const int PocComputeIntervalMs = 250;
+
+        private string lastPriceTargetsDebugSignature = string.Empty;
+
+        private static readonly string[] DirectionDebugPropertyNames =
+        {
+            "ToolMode", "PriceTargetsMode", "BracketsMode",
+            "Side", "PositionSide", "ToolSide", "Mode",
+            "Direction", "ModeValue", "ShortMode", "IsLong", "IsShort",
+            "TicksLeft", "TicksRight", "StopLoss", "TakeProfit", "OpenPrice", "EntryPrice"
+        };
+
+        private const BindingFlags DrawingMemberFlags =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        private static readonly string[] DirectionDebugNameKeywords =
+        {
+            "Side", "Mode", "Direction", "Short", "Long", "Position", "Tool", "Bracket",
+            "Target", "Operand", "Range", "Trade", "Tick"
+        };
 
         private bool IsVolumeProfileActive => ShowVolumeProfilePoc || ShowMarketProfile;
 
@@ -331,14 +352,16 @@ namespace VolaBubbles
             // Backfill az ablak hosszára (pl. 30 perc) háttérszálon, hogy ne blokkolja az OnInit-et.
             // A POC indulás után azonnal pontos lesz, nem kell megvárni, amíg élő tick-ekből felépül.
             StartBackgroundBackfill();
-            SubscribeChartDrawings();
+            if (PriceTargetsFeatureEnabled)
+                SubscribeChartDrawings();
 
             UpdateShortName();
         }
 
         protected override void OnClear()
         {
-            UnsubscribeChartDrawings();
+            if (PriceTargetsFeatureEnabled)
+                UnsubscribeChartDrawings();
 
             var t = tapeTimer;
             tapeTimer = null;
@@ -643,6 +666,12 @@ namespace VolaBubbles
             var chart = this.CurrentChart;
             if (chart == null) return;
 
+            // Chart overlay-k — history/tape nélkül is rajzolódnak.
+            DrawOpenOrderIndicator(args);
+            if (PriceTargetsFeatureEnabled)
+                DrawPriceTargetsTickLabel(args);
+            UpdateShortName();
+
             var mainWindow = chart.MainWindow;
             if (mainWindow == null) return;
 
@@ -693,12 +722,6 @@ namespace VolaBubbles
                 gr.Restore(state);
             }
 
-            // A nyitott order indikátort a clip-en kívül rajzoljuk, hogy a chart sarkában
-            // mindig látható legyen, függetlenül a tape sávtól.
-            DrawOpenOrderIndicator(args);
-            DrawPriceTargetsTickLabel(args);
-
-            UpdateShortName();
         }
 
         private void DrawBidAskLines(Graphics gr, IChartWindowCoordinatesConverter converter, float tapeLeftX, float tapeRightX)
@@ -1115,7 +1138,8 @@ namespace VolaBubbles
 
         private void SubscribeChartDrawings()
         {
-            if (!ShowPriceTargetsTicks) return;
+            if (!PriceTargetsFeatureEnabled) return;
+            if (!showPriceTargetsTicks && !showPriceTargetsDirectionDebug) return;
 
             var chart = this.CurrentChart;
             if (chart?.Drawings == null) return;
@@ -1143,8 +1167,11 @@ namespace VolaBubbles
 
         private void DrawPriceTargetsTickLabel(PaintChartEventArgs args)
         {
-            if (!ShowPriceTargetsTicks) return;
-            if (!TryGetLatestPriceTargetsInfo(out PriceTargetsInfo info)) return;
+            if (!PriceTargetsFeatureEnabled) return;
+            if (!showPriceTargetsTicks && !showPriceTargetsDirectionDebug) return;
+
+            if (!TryGetChartOverlayRectangle(out Rectangle overlayRect))
+                overlayRect = args.Rectangle;
 
             var gr = args.Graphics;
             var prevSmoothing = gr.SmoothingMode;
@@ -1152,23 +1179,383 @@ namespace VolaBubbles
 
             try
             {
+                if (showPriceTargetsDirectionDebug)
+                {
+                    if (TryGetLatestPriceTargetsDrawing(out IDrawing debugDrawing))
+                        DrawPriceTargetsDirectionDebugPanel(gr, overlayRect, debugDrawing);
+                    else
+                        DrawPriceTargetsDebugStatus(gr, overlayRect, "Debug ON — nincs PriceTargets rajz a charton");
+                }
+
+                if (!showPriceTargetsTicks) return;
+                if (!TryGetLatestPriceTargetsInfo(out PriceTargetsInfo info)) return;
+
                 string text = BuildPriceTargetsLabelText(info);
                 using (var font = new Font("Segoe UI", 10f, FontStyle.Bold))
-                using (var brush = new SolidBrush(PriceTargetsLabelColor))
+                using (var brush = new SolidBrush(priceTargetsLabelColor))
                 using (var format = new StringFormat
                 {
                     Alignment = StringAlignment.Center,
                     LineAlignment = StringAlignment.Far
                 })
                 {
-                    float y = args.Rectangle.Bottom - 8f;
-                    gr.DrawString(text, font, brush, args.Rectangle.Left + args.Rectangle.Width / 2f, y, format);
+                    float y = overlayRect.Bottom - 8f;
+                    if (showPriceTargetsDirectionDebug)
+                        y -= 140f;
+                    gr.DrawString(text, font, brush, overlayRect.Left + overlayRect.Width / 2f, y, format);
                 }
             }
             finally
             {
                 gr.SmoothingMode = prevSmoothing;
             }
+        }
+
+        private bool TryGetChartOverlayRectangle(out Rectangle rect)
+        {
+            rect = default;
+            var mainWindow = this.CurrentChart?.MainWindow;
+            if (mainWindow == null) return false;
+            rect = mainWindow.ClientRectangle;
+            return rect.Width > 0 && rect.Height > 0;
+        }
+
+        private static void DrawPriceTargetsDebugStatus(Graphics gr, Rectangle overlayRect, string message)
+        {
+            using (var font = new Font("Consolas", 9f, FontStyle.Bold))
+            using (var brush = new SolidBrush(Color.FromArgb(255, 255, 200, 80)))
+            using (var bgBrush = new SolidBrush(Color.FromArgb(200, 30, 30, 30)))
+            {
+                var size = gr.MeasureString(message, font);
+                float w = size.Width + 12f;
+                float h = size.Height + 8f;
+                float x = overlayRect.Left + 6f;
+                float y = overlayRect.Bottom - h - 6f;
+                gr.FillRectangle(bgBrush, x, y, w, h);
+                gr.DrawString(message, font, brush, x + 4f, y + 2f);
+            }
+        }
+
+        private void DrawPriceTargetsDirectionDebugPanel(Graphics gr, Rectangle overlayRect, IDrawing drawing)
+        {
+            double tickSize = GetChartTickSize();
+            var allLines = CollectPriceTargetsDirectionDebugLines(drawing, tickSize);
+            if (allLines.Count == 0)
+            {
+                DrawPriceTargetsDebugStatus(gr, overlayRect, "Debug ON — üres reflection dump");
+                return;
+            }
+
+            string signature = string.Join("\n", allLines);
+            if (!string.Equals(signature, lastPriceTargetsDebugSignature, StringComparison.Ordinal))
+            {
+                lastPriceTargetsDebugSignature = signature;
+                TryWritePriceTargetsDebugLog(signature);
+            }
+
+            var lines = new List<string>();
+            const int maxChartLines = 24;
+            for (int i = 0; i < allLines.Count && lines.Count < maxChartLines; i++)
+                lines.Add(allLines[i]);
+            if (allLines.Count > maxChartLines)
+                lines.Add($"... +{allLines.Count - maxChartLines} sor a log fájlban");
+
+            using (var font = new Font("Consolas", 8f, FontStyle.Regular))
+            using (var brush = new SolidBrush(Color.FromArgb(230, 255, 220, 120)))
+            using (var bgBrush = new SolidBrush(Color.FromArgb(200, 20, 20, 20)))
+            {
+                float lineHeight = font.GetHeight(gr) + 1f;
+                float maxWidth = 0f;
+                foreach (string line in lines)
+                {
+                    float w = gr.MeasureString(line, font).Width;
+                    if (w > maxWidth) maxWidth = w;
+                }
+
+                float panelHeight = lines.Count * lineHeight + 6f;
+                float panelWidth = Math.Min(maxWidth + 10f, overlayRect.Width - 12f);
+                float x = overlayRect.Left + 6f;
+                float y = overlayRect.Bottom - panelHeight - 6f;
+                gr.FillRectangle(bgBrush, x, y, panelWidth, panelHeight);
+
+                float textY = y + 3f;
+                foreach (string line in lines)
+                {
+                    gr.DrawString(line, font, brush, x + 4f, textY);
+                    textY += lineHeight;
+                }
+            }
+        }
+
+        private static void TryWritePriceTargetsDebugLog(string content)
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Quantower", "VolaBubbles");
+                Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, "price-targets-direction-debug.txt");
+                var sb = new StringBuilder();
+                sb.AppendLine($"--- {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ---");
+                sb.AppendLine(content);
+                sb.AppendLine();
+                File.WriteAllText(path, sb.ToString());
+            }
+            catch { }
+        }
+
+        private List<string> CollectPriceTargetsDirectionDebugLines(IDrawing drawing, double tickSize)
+        {
+            var lines = new List<string>();
+            if (drawing == null) return lines;
+
+            lines.Add("=== UI 'Tool mode' => ToolMode / PriceTargetsMode ===");
+            foreach (string key in new[] { "ToolMode", "PriceTargetsMode", "BracketsMode" })
+            {
+                if (TryFindDrawingMemberAny(drawing, key, out object value, out string path, 0))
+                    lines.Add($"[TOOL MODE?] {path} = {FormatDirectionDebugValue(value)}");
+                else
+                    lines.Add($"[TOOL MODE?] {key} => (not found)");
+            }
+
+            lines.Add($"Type: {drawing.GetType().Name}");
+            lines.Add($"FullName: {drawing.GetType().FullName}");
+
+            for (int i = 0; i < 16; i++)
+            {
+                try
+                {
+                    var point = drawing.GetPoint(i);
+                    lines.Add($"GetPoint({i}): {point.Item1:yyyy-MM-dd HH:mm:ss} @ {point.Item2:0.#####}");
+                }
+                catch { break; }
+            }
+
+            var visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            WalkObjectForDirectionDebug(drawing, "root", 0, visited, lines);
+
+            foreach (string propName in DirectionDebugPropertyNames)
+            {
+                if (TryFindDrawingMemberAny(drawing, propName, out object value, out string path, 0))
+                    lines.Add($"[FIND] {path} = {FormatDirectionDebugValue(value)}");
+            }
+
+            AppendDirectionResolutionDebug(drawing, tickSize, lines);
+            return lines;
+        }
+
+        private static void WalkObjectForDirectionDebug(
+            object obj,
+            string path,
+            int depth,
+            HashSet<object> visited,
+            List<string> lines)
+        {
+            if (obj == null || depth > 4) return;
+            if (!visited.Add(obj)) return;
+
+            const BindingFlags flags = DrawingMemberFlags;
+
+            foreach (var member in GetInspectableMembers(obj.GetType(), flags))
+            {
+                object raw;
+                try { raw = member.GetValue(obj); }
+                catch { continue; }
+
+                string memberPath = string.IsNullOrEmpty(path) ? member.Name : $"{path}.{member.Name}";
+                bool nameRelevant = IsDirectionRelevantMemberName(member.Name);
+                bool valueRelevant = IsDirectionRelevantLeafValue(raw);
+
+                if ((nameRelevant || valueRelevant) && raw != null && !ShouldRecurseIntoProperty(member.MemberType))
+                    lines.Add($"{memberPath} = {FormatDirectionDebugValue(raw)} [{member.MemberType.Name}]");
+
+                if (ShouldSkipDrawingReflectionBranch(member.MemberType))
+                    continue;
+
+                if (depth < 4 && raw != null && ShouldRecurseIntoProperty(member.MemberType))
+                    WalkObjectForDirectionDebug(raw, memberPath, depth + 1, visited, lines);
+            }
+        }
+
+        private readonly struct InspectableMember
+        {
+            public string Name { get; }
+            public Type MemberType { get; }
+            private readonly PropertyInfo prop;
+            private readonly FieldInfo field;
+
+            public InspectableMember(PropertyInfo p)
+            {
+                Name = p.Name;
+                MemberType = p.PropertyType;
+                prop = p;
+                field = null;
+            }
+
+            public InspectableMember(FieldInfo f)
+            {
+                Name = f.Name;
+                MemberType = f.FieldType;
+                prop = null;
+                field = f;
+            }
+
+            public object GetValue(object target)
+            {
+                if (prop != null) return prop.GetValue(target);
+                return field.GetValue(target);
+            }
+        }
+
+        private static IEnumerable<InspectableMember> GetInspectableMembers(Type type, BindingFlags flags)
+        {
+            foreach (var prop in type.GetProperties(flags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+                yield return new InspectableMember(prop);
+            }
+
+            foreach (var field in type.GetFields(flags))
+                yield return new InspectableMember(field);
+        }
+
+        private static bool IsDirectionRelevantMemberName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            for (int i = 0; i < DirectionDebugNameKeywords.Length; i++)
+            {
+                if (name.IndexOf(DirectionDebugNameKeywords[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool IsDirectionRelevantLeafValue(object raw)
+        {
+            if (raw == null) return false;
+            if (raw is bool || raw is Enum) return true;
+
+            if (raw is string s)
+            {
+                return s.IndexOf("Long", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("Buy", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("Sell", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+
+            return false;
+        }
+
+        private static string FormatDirectionDebugValue(object raw)
+        {
+            if (raw == null) return "null";
+            if (raw is Enum e)
+            {
+                try { return $"{e} ({Convert.ToInt32(e)})"; }
+                catch { return e.ToString(); }
+            }
+            if (raw is double d) return d.ToString("0.#####");
+            if (raw is float f) return f.ToString("0.#####");
+            if (raw is decimal m) return m.ToString("0.#####");
+            return raw.ToString();
+        }
+
+        private static bool TryFindDrawingMemberAny(
+            object root,
+            string name,
+            out object value,
+            out string path,
+            int depth)
+        {
+            value = null;
+            path = null;
+            if (root == null || depth > 4) return false;
+
+            const BindingFlags flags = DrawingMemberFlags;
+            foreach (var member in GetInspectableMembers(root.GetType(), flags))
+            {
+                object raw;
+                try { raw = member.GetValue(root); }
+                catch { continue; }
+
+                string memberPath = member.Name;
+                if (member.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && raw != null)
+                {
+                    value = raw;
+                    path = memberPath;
+                    return true;
+                }
+
+                if (ShouldSkipDrawingReflectionBranch(member.MemberType))
+                    continue;
+
+                if (depth < 4 && raw != null && ShouldRecurseIntoProperty(member.MemberType))
+                {
+                    if (TryFindDrawingMemberAny(raw, name, out value, out string nestedPath, depth + 1))
+                    {
+                        path = memberPath + "." + nestedPath;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void AppendDirectionResolutionDebug(IDrawing drawing, double tickSize, List<string> lines)
+        {
+            TryFindDrawingNumericDeep(drawing, "OpenPrice", out double openPrice);
+            if (openPrice <= 0)
+                TryFindDrawingNumericDeep(drawing, "EntryPrice", out openPrice);
+            TryFindDrawingNumericDeep(drawing, "StopLoss", out double stopLoss);
+            TryFindDrawingNumericDeep(drawing, "TakeProfit", out double takeProfit);
+            TryFindDrawingNumericDeep(drawing, "TicksLeft", out double ticksLeft);
+            TryFindDrawingNumericDeep(drawing, "TicksRight", out double ticksRight);
+
+            lines.Add($"--- Prices: Open={openPrice:0.#####} SL={stopLoss:0.#####} TP={takeProfit:0.#####} ---");
+            lines.Add($"--- Ticks: Left={ticksLeft:0.##} Right={ticksRight:0.##} ---");
+
+            if (TryFindDrawingToolModeIsShort(drawing, out bool toolModeShort))
+                lines.Add($"TryFindDrawingToolModeIsShort (ToolMode/PriceTargetsMode) => {(toolModeShort ? "SHORT" : "LONG")}");
+            else
+                lines.Add("TryFindDrawingToolModeIsShort => (not found)");
+
+            foreach (string modeName in new[] { "ToolMode", "PriceTargetsMode", "BracketsMode", "Mode", "Direction", "ModeValue", "ToolSide", "PositionSide" })
+            {
+                if (TryFindDrawingModeIsShort(drawing, modeName, out bool modeShort))
+                    lines.Add($"TryFindDrawingModeIsShort({modeName}) => {(modeShort ? "SHORT" : "LONG")}");
+                else
+                    lines.Add($"TryFindDrawingModeIsShort({modeName}) => (not found)");
+            }
+
+            if (TryFindDrawingSideIsShort(drawing, out bool sideShort))
+                lines.Add($"TryFindDrawingSideIsShort => {(sideShort ? "SHORT" : "LONG")}");
+            else
+                lines.Add("TryFindDrawingSideIsShort => (not found)");
+
+            if (TryFindDrawingBoolDeep(drawing, "ShortMode", out bool shortMode))
+                lines.Add($"ShortMode => {shortMode}");
+            else
+                lines.Add("ShortMode => (not found)");
+
+            double entry = openPrice;
+            EnsureEntryPrice(drawing, tickSize, stopLoss, takeProfit, ref entry);
+            ResolvePriceTargetsIsShort(drawing, entry, stopLoss, takeProfit, tickSize, out bool resolvedShort);
+            lines.Add($"EnsureEntryPrice => {entry:0.#####}");
+            lines.Add($"=> FINAL ResolvedIsShort: {(resolvedShort ? "SHORT" : "LONG")}");
+
+            if (TryGetNativePriceTargetTicks(drawing, out int slTicks, out int tpTicks, out double nativeEntry))
+                lines.Add($"NativeTicks: SL={slTicks} TP={tpTicks} Entry={nativeEntry:0.#####}");
+            else
+                lines.Add("NativeTicks: (not available)");
+        }
+
+        private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
+        {
+            public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
+            public new bool Equals(object x, object y) => ReferenceEquals(x, y);
+            public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
         }
 
         private string BuildPriceTargetsLabelText(PriceTargetsInfo info)
@@ -1186,7 +1573,7 @@ namespace VolaBubbles
                 parts.Add($"RR (TP/SL): {rr:0.##}");
             }
 
-            if (PositionRiskAmount > 0 && info.SlTicks > 0 &&
+            if (positionRiskAmount > 0 && info.SlTicks > 0 &&
                 TryCalculateMaxPositionSize(info, out double contracts))
             {
                 double lotStep = this.Symbol?.LotStep > 0 ? this.Symbol.LotStep : 1.0;
@@ -1214,7 +1601,7 @@ namespace VolaBubbles
             double riskPerContract = info.SlTicks * tickCost;
             if (riskPerContract <= 0) return false;
 
-            double raw = PositionRiskAmount / riskPerContract;
+            double raw = positionRiskAmount / riskPerContract;
             double lotStep = symbol.LotStep > 0 ? symbol.LotStep : 1.0;
             contracts = Math.Floor(raw / lotStep) * lotStep;
 
@@ -1250,31 +1637,8 @@ namespace VolaBubbles
         {
             info = default;
 
-            var chart = this.CurrentChart;
-            if (chart?.Drawings == null || this.Symbol == null) return false;
-
-            List<IDrawing> drawings;
-            try { drawings = chart.Drawings.GetAll(this.Symbol); }
-            catch { return false; }
-
-            if (drawings == null || drawings.Count == 0) return false;
-
-            IDrawing latest = null;
-            DateTime latestAnchor = DateTime.MinValue;
-
-            for (int i = 0; i < drawings.Count; i++)
-            {
-                var drawing = drawings[i];
-                if (drawing == null || drawing.Type != DrawingType.PriceTargets) continue;
-                if (!TryGetDrawingAnchorTime(drawing, out DateTime anchor)) continue;
-                if (anchor > latestAnchor)
-                {
-                    latestAnchor = anchor;
-                    latest = drawing;
-                }
-            }
-
-            if (latest == null) return false;
+            if (!TryGetLatestPriceTargetsDrawing(out IDrawing latest))
+                return false;
 
             double tickSize = GetChartTickSize();
             if (tickSize <= 0) return false;
@@ -1284,6 +1648,42 @@ namespace VolaBubbles
 
             info.IsValid = info.SlTicks > 0 || info.TpTicks > 0;
             return info.IsValid;
+        }
+
+        private bool TryGetLatestPriceTargetsDrawing(out IDrawing drawing)
+        {
+            drawing = null;
+
+            var chart = this.CurrentChart;
+            if (chart?.Drawings == null || this.Symbol == null) return false;
+
+            List<IDrawing> drawings;
+            try { drawings = chart.Drawings.GetAll(this.Symbol); }
+            catch { return false; }
+
+            if (drawings == null || drawings.Count == 0) return false;
+
+            DateTime latestAnchor = DateTime.MinValue;
+            IDrawing fallback = null;
+
+            for (int i = 0; i < drawings.Count; i++)
+            {
+                var candidate = drawings[i];
+                if (candidate == null || candidate.Type != DrawingType.PriceTargets) continue;
+
+                fallback = candidate;
+                if (!TryGetDrawingAnchorTime(candidate, out DateTime anchor)) continue;
+                if (anchor > latestAnchor)
+                {
+                    latestAnchor = anchor;
+                    drawing = candidate;
+                }
+            }
+
+            if (drawing == null)
+                drawing = fallback;
+
+            return drawing != null;
         }
 
         private static bool TryGetDrawingAnchorTime(IDrawing drawing, out DateTime anchor)
@@ -1310,68 +1710,532 @@ namespace VolaBubbles
         {
             info = default;
 
-            if (TryGetPriceTargetsInfoFromProperties(drawing, tickSize, out info))
-                return info.SlTicks > 0 || info.TpTicks > 0;
-
-            return TryGetPriceTargetsInfoFromPoints(drawing, tickSize, out info);
-        }
-
-        // A natív Price Targets objektum (PresentationLayer) StopLoss/TakeProfit/OpenPrice mezőit
-        // reflection-nel olvassuk — ezek nem részei az IDrawing interfésznek.
-        private static bool TryGetPriceTargetsInfoFromProperties(IDrawing drawing, double tickSize, out PriceTargetsInfo info)
-        {
-            info = default;
-
-            if (!TryGetDrawingDouble(drawing, "OpenPrice", out double entry) &&
-                !TryGetDrawingDouble(drawing, "EntryPrice", out entry))
+            if (TryGetNativePriceTargetTicks(drawing, out int slTicks, out int tpTicks, out double entryFromNative))
             {
-                entry = 0;
+                info.SlTicks = slTicks;
+                info.TpTicks = tpTicks;
+                info.EntryPrice = entryFromNative;
+                return slTicks > 0 || tpTicks > 0;
             }
 
-            bool hasSl = TryGetDrawingDouble(drawing, "StopLoss", out double slPrice);
-            bool hasTp = TryGetDrawingDouble(drawing, "TakeProfit", out double tpPrice);
-
-            if (!hasSl && !hasTp) return false;
-
-            if (entry <= 0)
-            {
-                if (!TryCollectDistinctPointPrices(drawing, tickSize, out var prices) || prices.Count < 2)
-                    return false;
-                prices.Sort();
-                entry = prices.Count >= 3 ? prices[1] : (prices[0] + prices[prices.Count - 1]) / 2.0;
-            }
+            if (!TryResolvePriceTargetsLevels(drawing, tickSize, out double entry, out double slPrice, out double tpPrice))
+                return false;
 
             info.EntryPrice = entry;
-            if (hasSl)
-                info.SlTicks = PriceDistanceToTicks(Math.Abs(entry - slPrice), tickSize);
-            if (hasTp)
-                info.TpTicks = PriceDistanceToTicks(Math.Abs(tpPrice - entry), tickSize);
-
+            info.SlTicks = PriceDistanceToTicks(entry, slPrice, tickSize);
+            info.TpTicks = PriceDistanceToTicks(entry, tpPrice, tickSize);
             return info.SlTicks > 0 || info.TpTicks > 0;
         }
 
-        private static bool TryGetPriceTargetsInfoFromPoints(IDrawing drawing, double tickSize, out PriceTargetsInfo info)
+        // Quantower Price Targets: TicksLeft/TicksRight — csak a rajz modelljén (ne HistoryItem.TicksLeft!).
+        private static bool TryGetNativePriceTargetTicks(
+            IDrawing drawing,
+            out int slTicks,
+            out int tpTicks,
+            out double entryPrice)
         {
-            info = default;
+            slTicks = 0;
+            tpTicks = 0;
+            entryPrice = 0;
 
-            if (!TryCollectDistinctPointPrices(drawing, tickSize, out var prices) || prices.Count < 3)
+            bool hasLeft = TryFindDrawingNumericDeep(drawing, "TicksLeft", out double left);
+            bool hasRight = TryFindDrawingNumericDeep(drawing, "TicksRight", out double right);
+            if (!hasLeft && !hasRight)
+                return false;
+
+            TryFindDrawingNumericDeep(drawing, "OpenPrice", out entryPrice);
+            if (entryPrice <= 0)
+                TryFindDrawingNumericDeep(drawing, "EntryPrice", out entryPrice);
+
+            int leftTicks = hasLeft ? (int)Math.Round(left) : 0;
+            int rightTicks = hasRight ? (int)Math.Round(right) : 0;
+
+            if (TryFindDrawingToolModeIsShort(drawing, out bool isShort))
+            {
+                // Tool mode short: a zónák vizuálisan tükröződnek — SL/TP tick hozzárendelés csere.
+                slTicks = isShort ? rightTicks : leftTicks;
+                tpTicks = isShort ? leftTicks : rightTicks;
+            }
+            else
+            {
+                slTicks = leftTicks;
+                tpTicks = rightTicks;
+            }
+
+            return slTicks > 0 && tpTicks > 0;
+        }
+
+        private int PriceDistanceToTicks(double price1, double price2, double tickSize)
+        {
+            if (this.Symbol != null)
+            {
+                try
+                {
+                    double ticks = this.Symbol.CalculateTicks(price1, price2);
+                    return Math.Max(1, (int)Math.Round(Math.Abs(ticks), MidpointRounding.AwayFromZero));
+                }
+                catch { /* fallback */ }
+            }
+
+            if (tickSize <= 0) return 0;
+            return Math.Max(1, (int)Math.Round(Math.Abs(price1 - price2) / tickSize, MidpointRounding.AwayFromZero));
+        }
+
+        private static bool TryResolvePriceTargetsLevels(
+            IDrawing drawing,
+            double tickSize,
+            out double entry,
+            out double slPrice,
+            out double tpPrice)
+        {
+            entry = 0;
+            slPrice = 0;
+            tpPrice = 0;
+
+            TryFindDrawingNumericDeep(drawing, "OpenPrice", out entry);
+            if (entry <= 0)
+                TryFindDrawingNumericDeep(drawing, "EntryPrice", out entry);
+
+            bool hasSl = TryFindDrawingNumericDeep(drawing, "StopLoss", out slPrice);
+            bool hasTp = TryFindDrawingNumericDeep(drawing, "TakeProfit", out tpPrice);
+
+            if (hasSl && hasTp)
+            {
+                EnsureEntryPrice(drawing, tickSize, slPrice, tpPrice, ref entry);
+                return entry > 0;
+            }
+
+            if (!TryCollectDistinctPointPrices(drawing, tickSize, out var prices) || prices.Count < 2)
                 return false;
 
             prices.Sort();
-            double slPrice = prices[0];
-            double entry = prices[1];
-            double tpPrice = prices[2];
+            double low = prices[0];
+            double high = prices[prices.Count - 1];
+            double mid = prices.Count >= 3 ? prices[1] : (low + high) / 2.0;
 
-            if (IsPriceTargetsShortMode(drawing))
+            if (entry <= 0 || entry < low - tickSize * 0.5 || entry > high + tickSize * 0.5)
+                entry = mid;
+
+            if (hasSl && hasTp)
+                return entry > 0;
+
+            ResolvePriceTargetsIsShort(drawing, entry, slPrice, tpPrice, tickSize, out bool isShort);
+
+            if (isShort)
             {
-                slPrice = prices[2];
-                tpPrice = prices[0];
+                slPrice = high;
+                tpPrice = low;
+            }
+            else
+            {
+                slPrice = low;
+                tpPrice = high;
             }
 
-            info.EntryPrice = entry;
-            info.SlTicks = PriceDistanceToTicks(Math.Abs(entry - slPrice), tickSize);
-            info.TpTicks = PriceDistanceToTicks(Math.Abs(tpPrice - entry), tickSize);
-            return info.SlTicks > 0 || info.TpTicks > 0;
+            return entry > 0;
+        }
+
+        private static void EnsureEntryPrice(
+            IDrawing drawing,
+            double tickSize,
+            double slPrice,
+            double tpPrice,
+            ref double entry)
+        {
+            if (entry > 0) return;
+
+            if (TryCollectDistinctPointPrices(drawing, tickSize, out var prices) && prices.Count >= 3)
+            {
+                prices.Sort();
+                entry = prices[1];
+                return;
+            }
+
+            if (slPrice > 0 && tpPrice > 0 && Math.Abs(slPrice - tpPrice) > tickSize * 0.5)
+                entry = (slPrice + tpPrice) / 2.0;
+        }
+
+        // UI "Tool mode" (LONG/SHORT) → reflection: ToolMode / PriceTargetsMode (Plugins DLL).
+        private static void ResolvePriceTargetsIsShort(
+            IDrawing drawing,
+            double entry,
+            double knownSlPrice,
+            double knownTpPrice,
+            double tickSize,
+            out bool isShort)
+        {
+            isShort = false;
+
+            if (TryFindDrawingToolModeIsShort(drawing, out isShort))
+                return;
+
+            foreach (string modeName in new[] { "Mode", "Direction", "ModeValue", "ToolSide", "PositionSide" })
+            {
+                if (TryFindDrawingModeIsShort(drawing, modeName, out isShort))
+                    return;
+            }
+
+            if (TryFindDrawingBoolDeep(drawing, "ShortMode", out bool shortMode) && shortMode)
+            {
+                isShort = true;
+                return;
+            }
+
+            if (TryFindDrawingSideIsShort(drawing, out isShort))
+                return;
+
+            if (knownSlPrice > 0 && entry > 0)
+            {
+                if (knownSlPrice > entry + tickSize * 0.5)
+                {
+                    isShort = true;
+                    return;
+                }
+
+                if (knownSlPrice < entry - tickSize * 0.5)
+                    return;
+            }
+
+            if (knownTpPrice > 0 && entry > 0)
+            {
+                if (knownTpPrice < entry - tickSize * 0.5)
+                {
+                    isShort = true;
+                    return;
+                }
+            }
+        }
+
+        private static bool TryFindDrawingToolModeIsShort(object root, out bool isShort)
+        {
+            isShort = false;
+            foreach (string modeName in new[] { "ToolMode", "PriceTargetsMode" })
+            {
+                if (TryFindDrawingModeIsShort(root, modeName, out isShort))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryFindDrawingSideIsShort(object root, out bool isShort)
+        {
+            isShort = false;
+            return TryFindDrawingMemberSideIsShort(root, "Side", out isShort, 0)
+                || TryFindDrawingMemberSideIsShort(root, "PositionSide", out isShort, 0)
+                || TryFindDrawingMemberSideIsShort(root, "ToolSide", out isShort, 0);
+        }
+
+        private static bool TryFindDrawingMemberSideIsShort(object root, string name, out bool isShort, int depth)
+        {
+            isShort = false;
+            if (root == null || depth > 4) return false;
+
+            var type = root.GetType();
+            foreach (var prop in type.GetProperties(DrawingMemberFlags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+
+                try
+                {
+                    object raw = prop.GetValue(root);
+                    if (raw == null) continue;
+
+                    if (prop.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!IsDirectionSidePropertyAcceptable(type, depth))
+                            continue;
+
+                        if (TryParseSideIsShort(raw, out isShort))
+                            return true;
+                    }
+
+                    if (ShouldSkipDrawingReflectionBranch(prop.PropertyType))
+                        continue;
+
+                    if (depth < 4 && raw != null && ShouldRecurseIntoProperty(prop.PropertyType))
+                    {
+                        if (TryFindDrawingMemberSideIsShort(raw, name, out isShort, depth + 1))
+                            return true;
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
+        private static bool IsDirectionSidePropertyAcceptable(Type ownerType, int depth)
+        {
+            if (depth <= 1) return true;
+            return IsPreferredPriceTargetsOwner(ownerType, "Side");
+        }
+
+        private static bool TryFindDrawingModeIsShort(object root, string propertyName, out bool isShort)
+        {
+            isShort = false;
+            return TryFindDrawingMemberModeIsShort(root, propertyName, out isShort, 0);
+        }
+
+        private static bool TryFindDrawingMemberModeIsShort(object root, string name, out bool isShort, int depth)
+        {
+            isShort = false;
+            if (root == null || depth > 4) return false;
+
+            foreach (var prop in root.GetType().GetProperties(DrawingMemberFlags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+
+                try
+                {
+                    object raw = prop.GetValue(root);
+                    if (raw == null) continue;
+
+                    if (prop.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (TryParseModeIsShort(raw, out isShort))
+                            return true;
+                    }
+
+                    if (ShouldSkipDrawingReflectionBranch(prop.PropertyType))
+                        continue;
+
+                    if (depth < 4 && ShouldRecurseIntoProperty(prop.PropertyType))
+                    {
+                        if (TryFindDrawingMemberModeIsShort(raw, name, out isShort, depth + 1))
+                            return true;
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
+        private static bool TryParseSideIsShort(object raw, out bool isShort)
+        {
+            isShort = false;
+            if (raw is Side side)
+            {
+                isShort = side == Side.Sell;
+                return true;
+            }
+
+            return TryParseModeIsShort(raw, out isShort);
+        }
+
+        private static bool TryParseModeIsShort(object raw, out bool isShort)
+        {
+            isShort = false;
+            if (raw is bool b)
+            {
+                isShort = b;
+                return true;
+            }
+
+            if (raw is int iv)
+            {
+                isShort = iv == 1;
+                return true;
+            }
+
+            string name = raw.ToString();
+            if (string.IsNullOrEmpty(name)) return false;
+
+            if (name.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Sell", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                isShort = true;
+                return true;
+            }
+
+            if (name.IndexOf("Long", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Buy", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                isShort = false;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool ShouldRecurseIntoProperty(Type type)
+        {
+            if (ShouldSkipDrawingReflectionBranch(type))
+                return false;
+            if (type.IsPrimitive || type == typeof(string) || type == typeof(decimal) || type.IsEnum)
+                return false;
+            if (type.Namespace != null && type.Namespace.StartsWith("System", StringComparison.Ordinal))
+                return false;
+            return true;
+        }
+
+        private static bool ShouldSkipDrawingReflectionBranch(Type type)
+        {
+            if (type == null) return true;
+            string full = type.FullName ?? type.Name;
+            if (full.IndexOf("HistoryItem", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (full.IndexOf("IHistoryItem", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
+        private static bool IsPriceTargetsNumericProperty(string propertyName)
+        {
+            switch (propertyName.ToUpperInvariant())
+            {
+                case "TICKSLEFT":
+                case "TICKSRIGHT":
+                case "STOPLOSS":
+                case "TAKEPROFIT":
+                case "OPENPRICE":
+                case "ENTRYPRICE":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsPreferredPriceTargetsOwner(Type ownerType, string propertyName)
+        {
+            if (ownerType == null) return false;
+            string name = ownerType.Name;
+            if (name.IndexOf("PriceTarget", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (name.Equals("Model", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.IndexOf("Drawing", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                name.IndexOf("History", StringComparison.OrdinalIgnoreCase) < 0) return true;
+
+            if (IsDirectionPropertyName(propertyName))
+            {
+                if (name.IndexOf("Setting", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (name.IndexOf("Tool", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsDirectionPropertyName(string propertyName)
+        {
+            return propertyName.Equals("ToolMode", StringComparison.OrdinalIgnoreCase)
+                || propertyName.Equals("PriceTargetsMode", StringComparison.OrdinalIgnoreCase)
+                || propertyName.Equals("BracketsMode", StringComparison.OrdinalIgnoreCase)
+                || propertyName.Equals("Mode", StringComparison.OrdinalIgnoreCase)
+                || propertyName.Equals("Direction", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryFindDrawingNumericDeep(object root, string name, out double value)
+        {
+            return TryFindDrawingMemberNumeric(root, name, out value, 0);
+        }
+
+        private static bool TryFindDrawingMemberNumeric(object root, string name, out double value, int depth)
+        {
+            value = 0;
+            if (root == null || depth > 4) return false;
+
+            foreach (var prop in root.GetType().GetProperties(DrawingMemberFlags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+
+                try
+                {
+                    object raw = prop.GetValue(root);
+                    if (raw == null) continue;
+
+                    if (prop.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (IsPriceTargetsNumericProperty(name) &&
+                            !IsPreferredPriceTargetsOwner(root.GetType(), name))
+                            continue;
+
+                        if (TryConvertToDouble(raw, out value) && value > 0)
+                            return true;
+                    }
+
+                    if (ShouldSkipDrawingReflectionBranch(prop.PropertyType))
+                        continue;
+
+                    if (depth < 4 && ShouldRecurseIntoProperty(prop.PropertyType))
+                    {
+                        if (TryFindDrawingMemberNumeric(raw, name, out value, depth + 1))
+                            return true;
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
+        private static bool TryFindDrawingBoolDeep(object root, string name, out bool value)
+        {
+            value = false;
+            return TryFindDrawingMemberBool(root, name, out value, 0);
+        }
+
+        private static bool TryFindDrawingMemberBool(object root, string name, out bool value, int depth)
+        {
+            value = false;
+            if (root == null || depth > 4) return false;
+
+            foreach (var prop in root.GetType().GetProperties(DrawingMemberFlags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+
+                try
+                {
+                    object raw = prop.GetValue(root);
+                    if (raw == null) continue;
+
+                    if (prop.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && raw is bool b)
+                    {
+                        value = b;
+                        return true;
+                    }
+
+                    if (ShouldSkipDrawingReflectionBranch(prop.PropertyType))
+                        continue;
+
+                    if (depth < 4 && ShouldRecurseIntoProperty(prop.PropertyType))
+                    {
+                        if (TryFindDrawingMemberBool(raw, name, out value, depth + 1))
+                            return true;
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
+        private static bool TryConvertToDouble(object raw, out double value)
+        {
+            value = 0;
+            if (raw == null) return false;
+
+            switch (raw)
+            {
+                case double d:
+                    value = d;
+                    return true;
+                case float f:
+                    value = f;
+                    return true;
+                case decimal m:
+                    value = (double)m;
+                    return true;
+                case int i:
+                    value = i;
+                    return true;
+                case long l:
+                    value = l;
+                    return true;
+                default:
+                    return double.TryParse(
+                        Convert.ToString(raw, System.Globalization.CultureInfo.InvariantCulture),
+                        System.Globalization.NumberStyles.Any,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out value);
+            }
         }
 
         private static bool TryCollectDistinctPointPrices(IDrawing drawing, double tickSize, out List<double> prices)
@@ -1399,60 +2263,6 @@ namespace VolaBubbles
             return prices.Count > 0;
         }
 
-        private static bool IsPriceTargetsShortMode(IDrawing drawing)
-        {
-            try
-            {
-                var modeProp = drawing.GetType().GetProperty("Mode", BindingFlags.Public | BindingFlags.Instance);
-                if (modeProp != null)
-                {
-                    object mode = modeProp.GetValue(drawing);
-                    if (mode != null)
-                    {
-                        string name = mode.ToString();
-                        if (name != null && name.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0)
-                            return true;
-                        if (name != null && name.IndexOf("Long", StringComparison.OrdinalIgnoreCase) >= 0)
-                            return false;
-                    }
-                }
-
-                var toolModeProp = drawing.GetType().GetProperty("ToolMode", BindingFlags.Public | BindingFlags.Instance);
-                if (toolModeProp != null)
-                {
-                    object mode = toolModeProp.GetValue(drawing);
-                    string name = mode?.ToString();
-                    if (name != null && name.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0)
-                        return true;
-                }
-            }
-            catch { }
-
-            return false;
-        }
-
-        private static bool TryGetDrawingDouble(IDrawing drawing, string propertyName, out double value)
-        {
-            value = 0;
-            try
-            {
-                var prop = drawing.GetType().GetProperty(
-                    propertyName,
-                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-                if (prop == null) return false;
-
-                object raw = prop.GetValue(drawing);
-                if (raw == null) return false;
-
-                value = Convert.ToDouble(raw, System.Globalization.CultureInfo.InvariantCulture);
-                return value > 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         private double GetChartTickSize()
         {
             var chart = this.CurrentChart;
@@ -1463,12 +2273,6 @@ namespace VolaBubbles
                 return this.Symbol.TickSize;
 
             return GetActualStep();
-        }
-
-        private static int PriceDistanceToTicks(double distance, double tickSize)
-        {
-            if (distance <= 0 || tickSize <= 0) return 0;
-            return Math.Max(1, (int)Math.Round(distance / tickSize, MidpointRounding.AwayFromZero));
         }
 
         // --- Open Order indikátor ---
