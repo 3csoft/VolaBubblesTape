@@ -10,6 +10,7 @@ VolaBubbles renders a continuously moving lane to the right of the latest candle
 - **Level 2 heatmap** (optional) — periodic DOM snapshots as vertical price-level columns on the tape, colored by a hot palette (dark blue → purple → red → yellow) with running-max normalization and decay.
 - **Market profile** (optional) — horizontal volume histogram on the tape for the configured VP window, behind price action.
 - **Volume profile POC** (optional) — POC 1 and POC 2 lines over the same window.
+- **Price Targets position sizer** (optional) — reads the chart’s built-in **Price targets** drawing and shows SL/TP distance in ticks, reward/risk (TP/SL), and max contract size from your risk budget.
 
 Tape elements drift left-to-right at a configurable pixel-per-second rate. Historical bubbles stay fixed to their bar time.
 
@@ -142,6 +143,33 @@ Open a fresh shell after `setx` for the values to be visible.
 - **Show Market Profile** — volume-by-price bars on the tape, behind bid/ask and bubbles.
 - **Market Profile Color** / **Market Profile Opacity (0.0..1.0)**.
 
+### Open order indicator
+
+- **Show Open Order Indicator** — blinking dot when limit/stop orders are working.
+- **Open Order Indicator Color**, **Blink Interval (ms)**, **Show Account Names**.
+
+### Price Targets & position size
+
+Uses Quantower’s native **Price targets** drawing tool (`DrawingType.PriceTargets`). Place or move a Price targets object on the chart; the indicator picks the **most recent** one (by anchor time) and prints a label at the **bottom center** of the chart.
+
+- **Show Price Targets Ticks** — master toggle; subscribes to chart drawing add/move/remove events.
+- **Price Targets Label Color** — label color (default: medium gray).
+- **Position Risk Amount** — account-currency risk budget (e.g. `100` = $100). When &gt; 0, adds **Size** = max whole/lot-step contracts that fit within that risk at the current SL distance.
+
+**Example label:**
+
+`SL: 87 ticks  |  TP: 127 ticks  |  RR (TP/SL): 1.46  |  Size: 2`
+
+**Position size formula:**
+
+```
+risk per contract = SL ticks × Symbol.GetTickCost(entry price)
+Size              = floor(Risk Amount / risk per contract), rounded down to LotStep
+RR (TP/SL)        = TP ticks / SL ticks
+```
+
+Works on **MNQ**, **MGC**, and other symbols where Quantower exposes tick cost and lot step (futures, CFDs, etc.). Set **Position Risk Amount** to `0` to hide size and show only ticks + RR.
+
 ## How the heatmap normalizes color
 
 For each rendered cell:
@@ -156,6 +184,8 @@ For each rendered cell:
 - **No heatmap** — confirm L2/DOM is enabled on your connection, **Show L2 Heatmap** is on, and **Heatmap Price Range** covers the visible book. Restart the indicator after enabling L2 so the subscription is sent.
 - **No historical bubbles** — trades need aggressor side (buy/sell); bar-only fallback is approximate.
 - **No POC / market profile** — needs trade ticks or backfill; enable **VP Backfill On Start**.
+- **No Price Targets label** — enable **Show Price Targets Ticks**, draw a **Price targets** object on the chart (same symbol), and reload the indicator if needed.
+- **Wrong contract size** — check **Position Risk Amount**, symbol **LotStep** / **MinLot**, and that SL ticks match the drawing (compare with the tool’s own tick readout).
 
 ## Roadmap
 

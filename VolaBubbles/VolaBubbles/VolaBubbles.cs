@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using TradingPlatform.BusinessLayer;
@@ -197,7 +198,24 @@ namespace VolaBubbles
         [InputParameter("Market Profile Opacity (0.0..1.0)", 80)]
         public double MarketProfileOpacity = 0.55;
 
+        [InputParameter("Show Price Targets Ticks", 85)]
+        public bool ShowPriceTargetsTicks = true;
+
+        [InputParameter("Price Targets Label Color", 86)]
+        public Color PriceTargetsLabelColor = Color.FromArgb(255, 128, 128, 128);
+
+        [InputParameter("Position Risk Amount", 87)]
+        public double PositionRiskAmount = 100.0;
+
         // --- Belső állapot ---
+
+        private struct PriceTargetsInfo
+        {
+            public int SlTicks;
+            public int TpTicks;
+            public double EntryPrice;
+            public bool IsValid;
+        }
 
         private readonly object stateLock = new object();
         private readonly Dictionary<double, PriceLevelData> currentBucketVolumes = new Dictionary<double, PriceLevelData>();
@@ -313,12 +331,15 @@ namespace VolaBubbles
             // Backfill az ablak hosszára (pl. 30 perc) háttérszálon, hogy ne blokkolja az OnInit-et.
             // A POC indulás után azonnal pontos lesz, nem kell megvárni, amíg élő tick-ekből felépül.
             StartBackgroundBackfill();
+            SubscribeChartDrawings();
 
             UpdateShortName();
         }
 
         protected override void OnClear()
         {
+            UnsubscribeChartDrawings();
+
             var t = tapeTimer;
             tapeTimer = null;
             t?.Dispose();
@@ -675,6 +696,7 @@ namespace VolaBubbles
             // A nyitott order indikátort a clip-en kívül rajzoljuk, hogy a chart sarkában
             // mindig látható legyen, függetlenül a tape sávtól.
             DrawOpenOrderIndicator(args);
+            DrawPriceTargetsTickLabel(args);
 
             UpdateShortName();
         }
@@ -1087,6 +1109,366 @@ namespace VolaBubbles
             if (v >= 10000) return (v / 1000.0).ToString("0") + "K";
             if (v >= 1000) return (v / 1000.0).ToString("0.#") + "K";
             return ((long)Math.Round(v)).ToString();
+        }
+
+        // --- Price Targets (chart drawing → SL/TP ticks) ---
+
+        private void SubscribeChartDrawings()
+        {
+            if (!ShowPriceTargetsTicks) return;
+
+            var chart = this.CurrentChart;
+            if (chart?.Drawings == null) return;
+
+            chart.Drawings.Added += OnChartDrawingChanged;
+            chart.Drawings.Moved += OnChartDrawingChanged;
+            chart.Drawings.Removed += OnChartDrawingChanged;
+        }
+
+        private void UnsubscribeChartDrawings()
+        {
+            var chart = this.CurrentChart;
+            if (chart?.Drawings == null) return;
+
+            chart.Drawings.Added -= OnChartDrawingChanged;
+            chart.Drawings.Moved -= OnChartDrawingChanged;
+            chart.Drawings.Removed -= OnChartDrawingChanged;
+        }
+
+        private void OnChartDrawingChanged(DrawingEventArgs e)
+        {
+            try { this.CurrentChart?.RedrawBuffer(); }
+            catch { }
+        }
+
+        private void DrawPriceTargetsTickLabel(PaintChartEventArgs args)
+        {
+            if (!ShowPriceTargetsTicks) return;
+            if (!TryGetLatestPriceTargetsInfo(out PriceTargetsInfo info)) return;
+
+            var gr = args.Graphics;
+            var prevSmoothing = gr.SmoothingMode;
+            gr.SmoothingMode = SmoothingMode.AntiAlias;
+
+            try
+            {
+                string text = BuildPriceTargetsLabelText(info);
+                using (var font = new Font("Segoe UI", 10f, FontStyle.Bold))
+                using (var brush = new SolidBrush(PriceTargetsLabelColor))
+                using (var format = new StringFormat
+                {
+                    Alignment = StringAlignment.Center,
+                    LineAlignment = StringAlignment.Far
+                })
+                {
+                    float y = args.Rectangle.Bottom - 8f;
+                    gr.DrawString(text, font, brush, args.Rectangle.Left + args.Rectangle.Width / 2f, y, format);
+                }
+            }
+            finally
+            {
+                gr.SmoothingMode = prevSmoothing;
+            }
+        }
+
+        private string BuildPriceTargetsLabelText(PriceTargetsInfo info)
+        {
+            var parts = new List<string>
+            {
+                $"SL: {info.SlTicks} ticks",
+                $"TP: {info.TpTicks} ticks"
+            };
+
+            if (info.SlTicks > 0 && info.TpTicks > 0)
+            {
+                // Reward/Risk = TP tick távolság / SL tick távolság
+                double rr = info.TpTicks / (double)info.SlTicks;
+                parts.Add($"RR (TP/SL): {rr:0.##}");
+            }
+
+            if (PositionRiskAmount > 0 && info.SlTicks > 0 &&
+                TryCalculateMaxPositionSize(info, out double contracts))
+            {
+                double lotStep = this.Symbol?.LotStep > 0 ? this.Symbol.LotStep : 1.0;
+                parts.Add($"Size: {FormatContractSize(contracts, lotStep)}");
+            }
+
+            return string.Join("  |  ", parts);
+        }
+
+        private bool TryCalculateMaxPositionSize(PriceTargetsInfo info, out double contracts)
+        {
+            contracts = 0;
+            var symbol = this.Symbol;
+            if (symbol == null || info.SlTicks <= 0) return false;
+
+            double entryPrice = info.EntryPrice > 0 ? info.EntryPrice : GetCurrentMidPrice();
+            if (entryPrice <= 0) return false;
+
+            double tickCost;
+            try { tickCost = symbol.GetTickCost(entryPrice); }
+            catch { return false; }
+
+            if (tickCost <= 0) return false;
+
+            double riskPerContract = info.SlTicks * tickCost;
+            if (riskPerContract <= 0) return false;
+
+            double raw = PositionRiskAmount / riskPerContract;
+            double lotStep = symbol.LotStep > 0 ? symbol.LotStep : 1.0;
+            contracts = Math.Floor(raw / lotStep) * lotStep;
+
+            if (symbol.MaxLot > 0 && contracts > symbol.MaxLot)
+                contracts = Math.Floor(symbol.MaxLot / lotStep) * lotStep;
+
+            if (contracts <= 0) return false;
+            if (symbol.MinLot > 0 && contracts < symbol.MinLot)
+                return false;
+
+            return true;
+        }
+
+        private static string FormatContractSize(double contracts, double lotStep)
+        {
+            if (contracts <= 0) return "0";
+
+            if (lotStep >= 1)
+                return ((long)Math.Round(contracts)).ToString();
+
+            int decimals = 0;
+            double step = lotStep;
+            while (step < 1 && decimals < 4)
+            {
+                step *= 10;
+                decimals++;
+            }
+
+            return contracts.ToString("0." + new string('#', Math.Max(1, decimals)));
+        }
+
+        private bool TryGetLatestPriceTargetsInfo(out PriceTargetsInfo info)
+        {
+            info = default;
+
+            var chart = this.CurrentChart;
+            if (chart?.Drawings == null || this.Symbol == null) return false;
+
+            List<IDrawing> drawings;
+            try { drawings = chart.Drawings.GetAll(this.Symbol); }
+            catch { return false; }
+
+            if (drawings == null || drawings.Count == 0) return false;
+
+            IDrawing latest = null;
+            DateTime latestAnchor = DateTime.MinValue;
+
+            for (int i = 0; i < drawings.Count; i++)
+            {
+                var drawing = drawings[i];
+                if (drawing == null || drawing.Type != DrawingType.PriceTargets) continue;
+                if (!TryGetDrawingAnchorTime(drawing, out DateTime anchor)) continue;
+                if (anchor > latestAnchor)
+                {
+                    latestAnchor = anchor;
+                    latest = drawing;
+                }
+            }
+
+            if (latest == null) return false;
+
+            double tickSize = GetChartTickSize();
+            if (tickSize <= 0) return false;
+
+            if (!TryGetPriceTargetsInfo(latest, tickSize, out info))
+                return false;
+
+            info.IsValid = info.SlTicks > 0 || info.TpTicks > 0;
+            return info.IsValid;
+        }
+
+        private static bool TryGetDrawingAnchorTime(IDrawing drawing, out DateTime anchor)
+        {
+            anchor = DateTime.MinValue;
+            for (int i = 0; i < 16; i++)
+            {
+                try
+                {
+                    var point = drawing.GetPoint(i);
+                    if (point.Item1 > anchor)
+                        anchor = point.Item1;
+                }
+                catch
+                {
+                    break;
+                }
+            }
+
+            return anchor > DateTime.MinValue;
+        }
+
+        private bool TryGetPriceTargetsInfo(IDrawing drawing, double tickSize, out PriceTargetsInfo info)
+        {
+            info = default;
+
+            if (TryGetPriceTargetsInfoFromProperties(drawing, tickSize, out info))
+                return info.SlTicks > 0 || info.TpTicks > 0;
+
+            return TryGetPriceTargetsInfoFromPoints(drawing, tickSize, out info);
+        }
+
+        // A natív Price Targets objektum (PresentationLayer) StopLoss/TakeProfit/OpenPrice mezőit
+        // reflection-nel olvassuk — ezek nem részei az IDrawing interfésznek.
+        private static bool TryGetPriceTargetsInfoFromProperties(IDrawing drawing, double tickSize, out PriceTargetsInfo info)
+        {
+            info = default;
+
+            if (!TryGetDrawingDouble(drawing, "OpenPrice", out double entry) &&
+                !TryGetDrawingDouble(drawing, "EntryPrice", out entry))
+            {
+                entry = 0;
+            }
+
+            bool hasSl = TryGetDrawingDouble(drawing, "StopLoss", out double slPrice);
+            bool hasTp = TryGetDrawingDouble(drawing, "TakeProfit", out double tpPrice);
+
+            if (!hasSl && !hasTp) return false;
+
+            if (entry <= 0)
+            {
+                if (!TryCollectDistinctPointPrices(drawing, tickSize, out var prices) || prices.Count < 2)
+                    return false;
+                prices.Sort();
+                entry = prices.Count >= 3 ? prices[1] : (prices[0] + prices[prices.Count - 1]) / 2.0;
+            }
+
+            info.EntryPrice = entry;
+            if (hasSl)
+                info.SlTicks = PriceDistanceToTicks(Math.Abs(entry - slPrice), tickSize);
+            if (hasTp)
+                info.TpTicks = PriceDistanceToTicks(Math.Abs(tpPrice - entry), tickSize);
+
+            return info.SlTicks > 0 || info.TpTicks > 0;
+        }
+
+        private static bool TryGetPriceTargetsInfoFromPoints(IDrawing drawing, double tickSize, out PriceTargetsInfo info)
+        {
+            info = default;
+
+            if (!TryCollectDistinctPointPrices(drawing, tickSize, out var prices) || prices.Count < 3)
+                return false;
+
+            prices.Sort();
+            double slPrice = prices[0];
+            double entry = prices[1];
+            double tpPrice = prices[2];
+
+            if (IsPriceTargetsShortMode(drawing))
+            {
+                slPrice = prices[2];
+                tpPrice = prices[0];
+            }
+
+            info.EntryPrice = entry;
+            info.SlTicks = PriceDistanceToTicks(Math.Abs(entry - slPrice), tickSize);
+            info.TpTicks = PriceDistanceToTicks(Math.Abs(tpPrice - entry), tickSize);
+            return info.SlTicks > 0 || info.TpTicks > 0;
+        }
+
+        private static bool TryCollectDistinctPointPrices(IDrawing drawing, double tickSize, out List<double> prices)
+        {
+            prices = new List<double>();
+            var seen = new HashSet<long>();
+
+            for (int i = 0; i < 16; i++)
+            {
+                try
+                {
+                    double price = drawing.GetPoint(i).Item2;
+                    if (price <= 0) continue;
+
+                    long key = (long)Math.Round(price / tickSize);
+                    if (seen.Add(key))
+                        prices.Add(price);
+                }
+                catch
+                {
+                    break;
+                }
+            }
+
+            return prices.Count > 0;
+        }
+
+        private static bool IsPriceTargetsShortMode(IDrawing drawing)
+        {
+            try
+            {
+                var modeProp = drawing.GetType().GetProperty("Mode", BindingFlags.Public | BindingFlags.Instance);
+                if (modeProp != null)
+                {
+                    object mode = modeProp.GetValue(drawing);
+                    if (mode != null)
+                    {
+                        string name = mode.ToString();
+                        if (name != null && name.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return true;
+                        if (name != null && name.IndexOf("Long", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return false;
+                    }
+                }
+
+                var toolModeProp = drawing.GetType().GetProperty("ToolMode", BindingFlags.Public | BindingFlags.Instance);
+                if (toolModeProp != null)
+                {
+                    object mode = toolModeProp.GetValue(drawing);
+                    string name = mode?.ToString();
+                    if (name != null && name.IndexOf("Short", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool TryGetDrawingDouble(IDrawing drawing, string propertyName, out double value)
+        {
+            value = 0;
+            try
+            {
+                var prop = drawing.GetType().GetProperty(
+                    propertyName,
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                if (prop == null) return false;
+
+                object raw = prop.GetValue(drawing);
+                if (raw == null) return false;
+
+                value = Convert.ToDouble(raw, System.Globalization.CultureInfo.InvariantCulture);
+                return value > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private double GetChartTickSize()
+        {
+            var chart = this.CurrentChart;
+            if (chart != null && chart.TickSize > 0)
+                return chart.TickSize;
+
+            if (this.Symbol != null && this.Symbol.TickSize > 0)
+                return this.Symbol.TickSize;
+
+            return GetActualStep();
+        }
+
+        private static int PriceDistanceToTicks(double distance, double tickSize)
+        {
+            if (distance <= 0 || tickSize <= 0) return 0;
+            return Math.Max(1, (int)Math.Round(distance / tickSize, MidpointRounding.AwayFromZero));
         }
 
         // --- Open Order indikátor ---
